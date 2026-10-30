@@ -25,8 +25,6 @@ jobs:
     concurrency:
       group: apk-build
       cancel-in-progress: false
-    outputs:
-      tag: ${{ steps.rel.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -187,7 +185,6 @@ jobs:
           ls -la out
 
       - name: Release-ə APK yüklə (köhnəni əvəz et)
-        id: rel
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -195,11 +192,16 @@ jobs:
           TYPE: ${{ steps.detect.outputs.type }}
         run: |
           TAG="apk-son"
-          gh release delete "$TAG" --cleanup-tag -y 2>/dev/null || true
+          # köhnə release-ləri (draft olanlar da) sil
+          for id in $(gh api "repos/$GH_REPO/releases" --paginate -q ".[] | select(.tag_name==\"$TAG\") | .id"); do
+            gh api -X DELETE "repos/$GH_REPO/releases/$id" || true
+          done
+          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$TAG" 2>/dev/null || true
           gh release create "$TAG" out/*.apk \
             --title "$NAME" \
             --notes "Növ: $TYPE, build ${{ github.run_number }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # APK düşən kimi tag-ı sil
+          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$TAG"
 
       - name: Zip-i repodan sil
         env:
@@ -210,31 +212,4 @@ jobs:
           git rm -q --ignore-unmatch -- "$ZPATH"
           git commit -m "zip silindi [skip ci]" || exit 0
           git push || { git pull --rebase origin "${{ github.ref_name }}" && git push; }
-
-  watch:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    concurrency:
-      group: watch-apk-son
-      cancel-in-progress: true
-    steps:
-      - name: Endirilən kimi release-i sil
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.build.outputs.tag }}
-        run: |
-          for i in $(seq 1 100); do
-            n=$(gh api "repos/$GH_REPO/releases/tags/$TAG" -q '[.assets[].download_count] | add // 0' 2>/dev/null || echo gone)
-            if [ "$n" = "gone" ]; then echo "Release artıq yoxdur"; exit 0; fi
-            if [ "$n" -gt 0 ]; then
-              echo "Endirildi, silinir: $TAG"
-              sleep 30
-              gh release delete "$TAG" --cleanup-tag -y || true
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "25 dəqiqə ərzində endirilmədi"
           
