@@ -39,7 +39,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: '8.14.3'
           cache-disabled: true
 
       - uses: actions/setup-node@v4
@@ -237,3 +237,4 @@ jobs:
             sleep 15
           done
           echo "25 dəqiqə ərzində endirilmədi"
+          
