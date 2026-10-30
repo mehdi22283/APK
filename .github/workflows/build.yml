@@ -1,0 +1,239 @@
+name: Zip to APK
+run-name: APK build ${{ github.run_number }}
+
+on:
+  push:
+    paths:
+      - '**.zip'
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: 'Zip faylının yolu (boş qalsa repodakı zip tapılır)'
+        required: false
+      java:
+        description: 'JDK versiyası'
+        required: false
+        default: '17'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: apk-build
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java || '17' }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+          cache-disabled: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Zip-i aç və növü tap
+        id: detect
+        env:
+          INPUT_ZIP: ${{ inputs.zip }}
+        run: |
+          set -eu
+          Z="$INPUT_ZIP"
+          if [ -z "$Z" ]; then Z=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- '*.zip' 2>/dev/null | head -1 || true); fi
+          if [ -z "$Z" ]; then Z=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -1 | sed 's|^\./||'); fi
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then echo "ZIP tapılmadı"; exit 1; fi
+          echo "Zip: $Z"
+          echo "zipname=$(basename "$Z" .zip)" >> "$GITHUB_OUTPUT"
+          echo "zippath=$Z" >> "$GITHUB_OUTPUT"
+          mkdir -p work
+          unzip -q -o "$Z" -d work
+          cd work
+          first() {
+            find . -maxdepth 6 -name "$1" -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/__MACOSX/*' -not -path '*/build/*' \
+              | awk -F/ '{print NF" "$0}' | sort -n | head -1 | cut -d' ' -f2- || true
+          }
+          depth() { if [ -z "$1" ]; then echo 99; else echo "$1" | tr -cd '/' | wc -c; fi; }
+          T=""; R="."
+          f=$(first pubspec.yaml)
+          if [ -n "$f" ] && grep -q 'flutter' "$f"; then T=flutter; R=$(dirname "$f"); fi
+          if [ -z "$T" ]; then
+            pj=$(first package.json)
+            gr=$(first settings.gradle)
+            [ -z "$gr" ] && gr=$(first settings.gradle.kts)
+            [ -z "$gr" ] && gr=$(first build.gradle)
+            [ -z "$gr" ] && gr=$(first build.gradle.kts)
+            if [ -n "$pj" ] && [ "$(depth "$pj")" -le "$(depth "$gr")" ]; then
+              R=$(dirname "$pj")
+              if grep -q '"@capacitor/core"' "$pj"; then T=capacitor
+              elif grep -q '"react-native"' "$pj"; then T=reactnative
+              elif grep -q '"expo"' "$pj"; then T=expo
+              elif [ -f "$R/config.xml" ] && grep -q '<widget' "$R/config.xml"; then T=cordova
+              else T=nodeweb; fi
+            elif [ -n "$gr" ]; then
+              T=gradle; R=$(dirname "$gr")
+            else
+              h=$(first index.html)
+              [ -z "$h" ] && h=$(first '*.html')
+              if [ -n "$h" ]; then
+                T=web; R=$(dirname "$h")
+                [ -f "$R/index.html" ] || cp "$h" "$R/index.html"
+              fi
+            fi
+          fi
+          if [ -z "$T" ]; then echo "Layihə növü tanınmadı"; exit 1; fi
+          echo "Növ: $T, qovluq: $R"
+          echo "type=$T" >> "$GITHUB_OUTPUT"
+          echo "root=$(cd "$R" && pwd)" >> "$GITHUB_OUTPUT"
+
+      - uses: subosito/flutter-action@v2
+        if: steps.detect.outputs.type == 'flutter'
+        with:
+          channel: stable
+
+      - name: Build
+        env:
+          TYPE: ${{ steps.detect.outputs.type }}
+          ROOT: ${{ steps.detect.outputs.root }}
+        run: |
+          set -eu
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          gb() {
+            cd "$1"
+            if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+              chmod +x gradlew
+              ./gradlew --no-daemon "$2"
+            else
+              gradle --no-daemon "$2"
+            fi
+          }
+          wrap() {
+            W=/tmp/wrap; rm -rf "$W"; mkdir -p "$W/www"
+            cp -r "$1"/. "$W/www/"
+            cd "$W"
+            npm init -y >/dev/null
+            npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+            npx cap init "App" com.zip2apk.web --web-dir www
+            npx cap add android
+            npx cap sync android
+            gb "$W/android" assembleDebug
+          }
+          case "$TYPE" in
+            flutter)
+              cd "$ROOT"
+              [ -d android ] || flutter create --platforms=android .
+              flutter pub get
+              flutter build apk --release ;;
+            capacitor)
+              cd "$ROOT"
+              npm install --legacy-peer-deps
+              npm run build --if-present
+              [ -d android ] || npx cap add android
+              npx cap sync android
+              gb "$ROOT/android" assembleDebug ;;
+            reactnative)
+              cd "$ROOT"
+              npm install --legacy-peer-deps
+              gb "$ROOT/android" assembleRelease ;;
+            expo)
+              cd "$ROOT"
+              npm install --legacy-peer-deps
+              npx expo prebuild --platform android --no-install
+              gb "$ROOT/android" assembleRelease ;;
+            cordova)
+              cd "$ROOT"
+              npm install -g cordova
+              if [ -f package.json ]; then npm install --legacy-peer-deps; fi
+              cordova platform add android || true
+              cordova build android ;;
+            nodeweb)
+              cd "$ROOT"
+              npm install --legacy-peer-deps
+              npm run build
+              D=""
+              for d in dist build www public out; do
+                if [ -f "$d/index.html" ]; then D="$d"; break; fi
+              done
+              [ -n "$D" ] || { echo "Web build qovluğu tapılmadı"; exit 1; }
+              wrap "$ROOT/$D" ;;
+            web)
+              wrap "$ROOT" ;;
+            gradle)
+              gb "$ROOT" assembleDebug ;;
+          esac
+
+      - name: Tək APK seç
+        env:
+          NAME: ${{ steps.detect.outputs.zipname }}
+        run: |
+          mkdir -p out
+          BEST=$(find "$GITHUB_WORKSPACE/work" /tmp/wrap -name '*.apk' -not -path '*/intermediates/*' -not -name '*androidTest*' -not -name '*unaligned*' -printf '%s %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+          [ -n "$BEST" ] || { echo "APK tapılmadı"; exit 1; }
+          echo "Seçildi: $BEST"
+          cp "$BEST" "out/${NAME}.apk"
+          ls -la out
+
+      - name: Release-ə APK yüklə (köhnəni əvəz et)
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ steps.detect.outputs.zipname }}
+          TYPE: ${{ steps.detect.outputs.type }}
+        run: |
+          TAG="apk-son"
+          gh release delete "$TAG" --cleanup-tag -y 2>/dev/null || true
+          gh release create "$TAG" out/*.apk \
+            --title "$NAME" \
+            --notes "Növ: $TYPE, build ${{ github.run_number }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Zip-i repodan sil
+        env:
+          ZPATH: ${{ steps.detect.outputs.zippath }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git rm -q --ignore-unmatch -- "$ZPATH"
+          git commit -m "zip silindi [skip ci]" || exit 0
+          git push || { git pull --rebase origin "${{ github.ref_name }}" && git push; }
+
+  watch:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: watch-apk-son
+      cancel-in-progress: true
+    steps:
+      - name: Endirilən kimi release-i sil
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          for i in $(seq 1 100); do
+            n=$(gh api "repos/$GH_REPO/releases/tags/$TAG" -q '[.assets[].download_count] | add // 0' 2>/dev/null || echo gone)
+            if [ "$n" = "gone" ]; then echo "Release artıq yoxdur"; exit 0; fi
+            if [ "$n" -gt 0 ]; then
+              echo "Endirildi, silinir: $TAG"
+              sleep 30
+              gh release delete "$TAG" --cleanup-tag -y || true
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "25 dəqiqə ərzində endirilmədi"
