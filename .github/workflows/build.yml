@@ -25,6 +25,8 @@ jobs:
     concurrency:
       group: apk-build
       cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -185,6 +187,7 @@ jobs:
           ls -la out
 
       - name: Release-ə APK yüklə (köhnəni əvəz et)
+        id: rel
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -192,16 +195,11 @@ jobs:
           TYPE: ${{ steps.detect.outputs.type }}
         run: |
           TAG="apk-son"
-          # köhnə release-ləri (draft olanlar da) sil
-          for id in $(gh api "repos/$GH_REPO/releases" --paginate -q ".[] | select(.tag_name==\"$TAG\") | .id"); do
-            gh api -X DELETE "repos/$GH_REPO/releases/$id" || true
-          done
-          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$TAG" 2>/dev/null || true
+          gh release delete "$TAG" --cleanup-tag -y 2>/dev/null || true
           gh release create "$TAG" out/*.apk \
             --title "$NAME" \
             --notes "Növ: $TYPE, build ${{ github.run_number }}"
-          # APK düşən kimi tag-ı sil
-          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Zip-i repodan sil
         env:
